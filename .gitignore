@@ -1,0 +1,15 @@
+__pycache__/
+*.py[cod]
+*.egg-info/
+.env
+.env.*
+*.pem
+*.p8
+*.key
+
+.streamlit/secrets.toml
+
+*.log
+.DS_Store
+.vscode/
+.idea/
