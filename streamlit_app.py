@@ -313,7 +313,8 @@ def load_granular_data() -> pd.DataFrame:
     return result
 
 
-get_conn()
+if not IS_SIS:
+    get_conn()
 
 hdr_left, hdr_right = st.columns([8, 2])
 with hdr_left:
