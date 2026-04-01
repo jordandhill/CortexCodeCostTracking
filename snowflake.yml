@@ -1,0 +1,17 @@
+definition_version: 2
+entities:
+  cortex_code_dashboard:
+    type: streamlit
+    identifier:
+      name: CORTEX_CODE_CONSUMPTION_DASHBOARD
+      database: CORTEX_CODE_DASHBOARD
+      schema: PUBLIC
+    query_warehouse: COMPUTE_G2_M
+    runtime_name: SYSTEM$ST_CONTAINER_RUNTIME_PY3_11
+    compute_pool: STREAMLIT_COMPUTE_POOL
+    external_access_integrations:
+      - PYPI_ACCESS_INTEGRATION
+    main_file: streamlit_app.py
+    artifacts:
+      - streamlit_app.py
+      - pyproject.toml

@@ -1,12 +1,27 @@
 from datetime import date, timedelta
+import json
 import os
+import re
+import tempfile
+import urllib.request
 import pandas as pd
 import streamlit as st
 import altair as alt
-import snowflake.connector
-from cryptography.hazmat.primitives import serialization
-from pathlib import Path
-import tomllib
+
+IS_SIS = False
+_snowpark_session = None
+try:
+    from snowflake.snowpark.context import get_active_session
+    _snowpark_session = get_active_session()
+    IS_SIS = True
+except Exception:
+    pass
+
+if not IS_SIS:
+    import snowflake.connector
+    from cryptography.hazmat.primitives import serialization
+    from pathlib import Path
+    import tomllib
 
 st.set_page_config(
     page_title="Cortex Code consumption",
@@ -17,15 +32,24 @@ st.set_page_config(
 TIME_RANGES = ["1W", "1M", "3M", "6M", "YTD", "All"]
 CHART_HEIGHT = 350
 SOURCES = {"CLI": "CORTEX_CODE_CLI_USAGE_HISTORY", "Snowsight": "CORTEX_CODE_SNOWSIGHT_USAGE_HISTORY"}
+PRICING_CHANGE_DATE = date(2026, 4, 1)
+CREDIT_PRICE_TIERS = {
+    "Global ($2.00) — effective Apr 1, 2026": 2.00,
+    "In-region ($2.20) — effective Apr 1, 2026": 2.20,
+}
 
 CORTEX_CODE_PRICING = {
+    "claude-4-sonnet": {"input": 1.50, "cache_read_input": 0.15, "cache_write_input": 1.88, "output": 7.50},
     "claude-opus-4-5": {"input": 2.75, "cache_read_input": 0.28, "cache_write_input": 3.44, "output": 13.75},
     "claude-opus-4-6": {"input": 2.75, "cache_read_input": 0.28, "cache_write_input": 3.44, "output": 13.75},
     "claude-sonnet-4-5": {"input": 1.65, "cache_read_input": 0.17, "cache_write_input": 2.07, "output": 8.25},
     "claude-sonnet-4-6": {"input": 1.65, "cache_read_input": 0.17, "cache_write_input": 2.07, "output": 8.25},
-    "claude-4-sonnet": {"input": 1.50, "cache_read_input": 0.15, "cache_write_input": 1.88, "output": 7.53},
-    "openai-gpt-5.2": {"input": 0.97, "cache_read_input": 0.10, "cache_write_input": 1.21, "output": 7.74},
+    "openai-gpt-5.2": {"input": 0.97, "cache_read_input": 0.10, "cache_write_input": 0.0, "output": 7.70},
+    "openai-gpt-5.44": {"input": 1.38, "cache_read_input": 0.14, "cache_write_input": 0.0, "output": 8.25},
 }
+
+CONSUMPTION_TABLE_URL = "https://www.snowflake.com/legal-files/CreditConsumptionTable.pdf"
+PRICING_STAGE = "CORTEX_CODE_DASHBOARD.PUBLIC.PRICING_DOCS"
 
 TOKEN_TYPES = ["input", "cache_read", "cache_write", "output"]
 TOKEN_TYPE_LABELS = {
@@ -36,41 +60,46 @@ TOKEN_TYPE_LABELS = {
 }
 
 
-@st.cache_resource
-def get_conn():
-    try:
-        conn_name = os.getenv("SNOWFLAKE_CONNECTION_NAME") or os.getenv("SNOWFLAKE_DEFAULT_CONNECTION_NAME") or "default"
-        toml_path = Path.home() / ".snowflake" / "connections.toml"
-        cfg = {}
-        if toml_path.exists():
-            with open(toml_path, "rb") as f:
-                all_conns = tomllib.load(f)
-            cfg = all_conns.get(conn_name, {})
-        key_path = cfg.get("private_key_path")
-        kwargs = {
-            "account": cfg.get("account"),
-            "user": cfg.get("user"),
-            "role": cfg.get("role"),
-            "warehouse": cfg.get("warehouse"),
-        }
-        if key_path:
-            with open(key_path, "rb") as kf:
-                pk = serialization.load_pem_private_key(kf.read(), password=None)
-            kwargs["private_key"] = pk.private_bytes(
-                serialization.Encoding.DER,
-                serialization.PrivateFormat.PKCS8,
-                serialization.NoEncryption(),
-            )
-        elif cfg.get("authenticator"):
-            kwargs["authenticator"] = cfg["authenticator"]
-        return snowflake.connector.connect(**{k: v for k, v in kwargs.items() if v is not None})
-    except Exception as e:
-        st.error(f"Failed to connect to Snowflake: {e}")
-        st.info("Set SNOWFLAKE_DEFAULT_CONNECTION_NAME or configure a 'default' connection.")
-        st.stop()
+if not IS_SIS:
+    @st.cache_resource
+    def get_conn():
+        try:
+            conn_name = os.getenv("SNOWFLAKE_CONNECTION_NAME") or os.getenv("SNOWFLAKE_DEFAULT_CONNECTION_NAME") or "default"
+            toml_path = Path.home() / ".snowflake" / "connections.toml"
+            cfg = {}
+            if toml_path.exists():
+                with open(toml_path, "rb") as f:
+                    all_conns = tomllib.load(f)
+                cfg = all_conns.get(conn_name, {})
+            key_path = cfg.get("private_key_path")
+            kwargs = {
+                "account": cfg.get("account"),
+                "user": cfg.get("user"),
+                "role": cfg.get("role"),
+                "warehouse": cfg.get("warehouse"),
+            }
+            if key_path:
+                with open(key_path, "rb") as kf:
+                    pk = serialization.load_pem_private_key(kf.read(), password=None)
+                kwargs["private_key"] = pk.private_bytes(
+                    serialization.Encoding.DER,
+                    serialization.PrivateFormat.PKCS8,
+                    serialization.NoEncryption(),
+                )
+            elif cfg.get("authenticator"):
+                kwargs["authenticator"] = cfg["authenticator"]
+            return snowflake.connector.connect(**{k: v for k, v in kwargs.items() if v is not None})
+        except Exception as e:
+            st.error(f"Failed to connect to Snowflake: {e}")
+            st.info("Set SNOWFLAKE_DEFAULT_CONNECTION_NAME or configure a 'default' connection.")
+            st.stop()
 
 
 def run_query(sql: str) -> pd.DataFrame:
+    if IS_SIS:
+        df = _snowpark_session.sql(sql).to_pandas()
+        df.columns = [c.lower() for c in df.columns]
+        return df
     conn = get_conn()
     cur = conn.cursor()
     try:
@@ -80,6 +109,122 @@ def run_query(sql: str) -> pd.DataFrame:
         return pd.DataFrame(rows, columns=cols)
     finally:
         cur.close()
+
+
+def run_scalar(sql: str):
+    if IS_SIS:
+        return _snowpark_session.sql(sql).collect()[0][0]
+    conn = get_conn()
+    cur = conn.cursor()
+    try:
+        cur.execute(sql)
+        return cur.fetchone()[0]
+    finally:
+        cur.close()
+
+
+def refresh_pricing_from_pdf() -> dict:
+    if IS_SIS:
+        raise RuntimeError(
+            "PDF download from the internet is not available in Streamlit in Snowflake. "
+            "Upload the PDF to the stage manually and use 'Refresh from Stage' instead."
+        )
+    with tempfile.TemporaryDirectory() as td:
+        pdf_path = os.path.join(td, "CreditConsumptionTable.pdf")
+        req = urllib.request.Request(CONSUMPTION_TABLE_URL, headers={
+            "User-Agent": "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36"
+        })
+        with urllib.request.urlopen(req) as resp, open(pdf_path, "wb") as out:
+            out.write(resp.read())
+        conn = get_conn()
+        cur = conn.cursor()
+        try:
+            cur.execute(f"CREATE DATABASE IF NOT EXISTS CORTEX_CODE_DASHBOARD")
+            cur.execute(f"CREATE SCHEMA IF NOT EXISTS CORTEX_CODE_DASHBOARD.PUBLIC")
+            cur.execute(f"CREATE STAGE IF NOT EXISTS {PRICING_STAGE} ENCRYPTION = (TYPE = 'SNOWFLAKE_SSE')")
+            cur.execute(f"PUT file://{pdf_path} @{PRICING_STAGE} AUTO_COMPRESS=FALSE OVERWRITE=TRUE")
+        finally:
+            cur.close()
+
+    raw_json = run_scalar(f"""
+        SELECT AI_PARSE_DOCUMENT(
+            TO_FILE('@{PRICING_STAGE}', 'CreditConsumptionTable.pdf'),
+            {{'mode': 'LAYOUT', 'page_split': true}}
+        )::VARCHAR
+    """)
+    parsed = json.loads(raw_json)
+    pricing = {}
+    for page in parsed.get("pages", []):
+        content = page.get("content", "")
+        if "6(g)" not in content or "cortex code" not in content.lower():
+            continue
+        for line in content.split("\n"):
+            line = line.strip().strip("|")
+            if not line or line.startswith("---") or "Model" in line or "Snowflake" in line:
+                continue
+            parts = [c.strip() for c in line.split("|")]
+            if len(parts) < 5:
+                continue
+            model = parts[0].strip()
+            if not model or not re.match(r"^[a-z]", model):
+                continue
+            try:
+                inp = float(parts[1])
+                out = float(parts[2])
+                cw_raw = parts[3].strip()
+                cache_write = float(cw_raw) if cw_raw != "-" else 0.0
+                cr = float(parts[4])
+                pricing[model] = {
+                    "input": inp,
+                    "output": out,
+                    "cache_write_input": cache_write,
+                    "cache_read_input": cr,
+                }
+            except (ValueError, IndexError):
+                continue
+        break
+    return pricing
+
+
+def refresh_pricing_from_stage() -> dict:
+    raw_json = run_scalar(f"""
+        SELECT AI_PARSE_DOCUMENT(
+            TO_FILE('@{PRICING_STAGE}', 'CreditConsumptionTable.pdf'),
+            {{'mode': 'LAYOUT', 'page_split': true}}
+        )::VARCHAR
+    """)
+    parsed = json.loads(raw_json)
+    pricing = {}
+    for page in parsed.get("pages", []):
+        content = page.get("content", "")
+        if "6(g)" not in content or "cortex code" not in content.lower():
+            continue
+        for line in content.split("\n"):
+            line = line.strip().strip("|")
+            if not line or line.startswith("---") or "Model" in line or "Snowflake" in line:
+                continue
+            parts = [c.strip() for c in line.split("|")]
+            if len(parts) < 5:
+                continue
+            model = parts[0].strip()
+            if not model or not re.match(r"^[a-z]", model):
+                continue
+            try:
+                inp = float(parts[1])
+                out = float(parts[2])
+                cw_raw = parts[3].strip()
+                cache_write = float(cw_raw) if cw_raw != "-" else 0.0
+                cr = float(parts[4])
+                pricing[model] = {
+                    "input": inp,
+                    "output": out,
+                    "cache_write_input": cache_write,
+                    "cache_read_input": cr,
+                }
+            except (ValueError, IndexError):
+                continue
+        break
+    return pricing
 
 
 def filter_by_time_range(df: pd.DataFrame, x_col: str, time_range: str) -> pd.DataFrame:
@@ -185,9 +330,9 @@ available_sources = sorted(raw["source"].unique())
 
 with st.sidebar:
     st.header("Settings")
-    price_per_credit = st.number_input(
-        "Price per credit ($)", min_value=0.01, value=3.00, step=0.25, format="%.2f"
-    )
+    tier_labels = list(CREDIT_PRICE_TIERS.keys())
+    selected_tier = st.selectbox("Credit pricing tier", tier_labels, index=0, key="tier")
+    price_per_credit = CREDIT_PRICE_TIERS[selected_tier]
     time_range = st.selectbox("Time range", TIME_RANGES, index=TIME_RANGES.index("All"), key="tr")
     source_filter = st.multiselect("Source", available_sources, default=available_sources, key="src")
     all_users = sorted(raw["user_name"].dropna().unique())
@@ -479,8 +624,10 @@ with tab_pricing:
     st.subheader("Snowflake AI Features Credit Table")
     st.caption("Table 6(g): Cortex Code — Credits per 1M tokens by model and token type")
 
+    active_pricing = st.session_state.get("refreshed_pricing", CORTEX_CODE_PRICING)
+
     pricing_rows = []
-    for model, rates in CORTEX_CODE_PRICING.items():
+    for model, rates in active_pricing.items():
         pricing_rows.append({
             "Model": model,
             "Input": rates["input"],
@@ -503,13 +650,81 @@ with tab_pricing:
     )
 
     st.divider()
+
+    st.warning(
+        "**Pricing is subject to change.** The rates shown above are extracted from the "
+        "[Snowflake Service Consumption Table](https://www.snowflake.com/legal-files/CreditConsumptionTable.pdf) "
+        "and may not reflect the latest published values. Always verify against your Snowflake contract or the official documentation.",
+        icon=":material/warning:",
+    )
+
+    st.subheader("Keeping prices up to date")
+    st.markdown(
+        "The **Refresh from PDF** button below attempts to download the Consumption Table PDF directly "
+        "from Snowflake's website and extract Table 6(g) using `CORTEX AI_PARSE_DOCUMENT`. "
+        "This may fail if the PDF URL changes or if outbound network access is restricted.\n\n"
+        "**Alternative update methods:**\n"
+        "1. **Manual download & stage upload** — Download "
+        "[CreditConsumptionTable.pdf](https://www.snowflake.com/legal-files/CreditConsumptionTable.pdf) "
+        "yourself, then upload it to the Snowflake stage:\n"
+        "   ```sql\n"
+        f"   PUT file:///path/to/CreditConsumptionTable.pdf @{PRICING_STAGE} AUTO_COMPRESS=FALSE OVERWRITE=TRUE;\n"
+        "   ```\n"
+        "   You can also upload the file through the **Snowsight UI**: navigate to "
+        f"**Data → Databases → `{PRICING_STAGE.split('.')[0]}` → `{PRICING_STAGE.split('.')[1]}` → Stages → "
+        f"`{PRICING_STAGE.split('.')[2]}`** and use the **+ Files** button to upload the PDF.\n\n"
+        f"   > **Stage location:** `@{PRICING_STAGE}` — to change this, update the `PRICING_STAGE` "
+        "constant at the top of `streamlit_app.py`. The stage must use `ENCRYPTION = (TYPE = 'SNOWFLAKE_SSE')` "
+        "for `AI_PARSE_DOCUMENT` compatibility.\n"
+        "2. **External Access Integration** — Create a Snowflake "
+        "[External Access Integration](https://docs.snowflake.com/en/developer-guide/external-network-access/creating-using-external-network-access) "
+        "to allow the app to fetch the PDF without relying on local network egress.\n"
+        "3. **Edit the built-in defaults** — Update the `CORTEX_CODE_PRICING` dictionary in "
+        "`streamlit_app.py` directly if you prefer a static configuration."
+    )
+
+    refresh_col, stage_col, info_col = st.columns([1, 1, 2])
+    with refresh_col:
+        if not IS_SIS:
+            if st.button(":material/refresh: Refresh from PDF", help="Download the latest Snowflake Consumption Table PDF and extract Table 6(g) using Cortex AI_PARSE_DOCUMENT"):
+                with st.spinner("Downloading PDF and extracting pricing via Cortex AI_PARSE_DOCUMENT..."):
+                    try:
+                        new_pricing = refresh_pricing_from_pdf()
+                        if new_pricing:
+                            st.session_state["refreshed_pricing"] = new_pricing
+                            st.success(f"Refreshed pricing for {len(new_pricing)} models.")
+                            st.rerun()
+                        else:
+                            st.error("Could not extract Table 6(g) from the PDF.")
+                    except Exception as e:
+                        st.error(f"Refresh failed: {e}")
+    with stage_col:
+        if st.button(":material/refresh: Refresh from Stage", help=f"Parse CreditConsumptionTable.pdf from @{PRICING_STAGE} using Cortex AI_PARSE_DOCUMENT"):
+            with st.spinner("Extracting pricing from staged PDF via Cortex AI_PARSE_DOCUMENT..."):
+                try:
+                    new_pricing = refresh_pricing_from_stage()
+                    if new_pricing:
+                        st.session_state["refreshed_pricing"] = new_pricing
+                        st.success(f"Refreshed pricing for {len(new_pricing)} models.")
+                        st.rerun()
+                    else:
+                        st.error("Could not extract Table 6(g) from the staged PDF.")
+                except Exception as e:
+                    st.error(f"Stage refresh failed: {e}")
+    with info_col:
+        if "refreshed_pricing" in st.session_state:
+            st.caption(":material/check_circle: Pricing refreshed from live PDF via Cortex AI_PARSE_DOCUMENT")
+        else:
+            st.caption(":material/info: Showing built-in pricing defaults. Click refresh to pull latest from Snowflake Consumption Table PDF.")
+
+    st.divider()
     st.subheader("Your observed rates vs. published rates")
 
     if not granular_filtered.empty:
         observed_rows = []
         for _, row in model_summary.iterrows():
             m = row["model_name"]
-            published = CORTEX_CODE_PRICING.get(m, {})
+            published = active_pricing.get(m, {})
             obs_input = (row["input_credits"] / row["input_tokens"] * 1_000_000) if row["input_tokens"] > 0 else None
             obs_cache_read = (row["cache_read_credits"] / row["cache_read_tokens"] * 1_000_000) if row["cache_read_tokens"] > 0 else None
             obs_cache_write = (row["cache_write_credits"] / row["cache_write_tokens"] * 1_000_000) if row["cache_write_tokens"] > 0 else None
@@ -538,4 +753,9 @@ with tab_pricing:
 
     st.caption("Source: [Snowflake Service Consumption Table](https://www.snowflake.com/legal-files/CreditConsumptionTable.pdf) — Table 6(g): Cortex Code")
 
+pricing_note = (
+    ":material/info: Beginning April 1, 2026, AI credits move to a single list price: "
+    "**$2.00/credit (global)** or **$2.20/credit (in-region)**, applied consistently across all customers regardless of edition."
+)
+st.caption(pricing_note)
 st.caption(f":material/info: Data from SNOWFLAKE.ACCOUNT_USAGE views. Available sources: {', '.join(available_sources)}. Price per credit: ${price_per_credit:.2f}")
