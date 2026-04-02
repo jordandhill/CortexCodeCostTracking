@@ -7,6 +7,7 @@ __pycache__/
 *.p8
 *.key
 .venv/
+output/
 
 .streamlit/secrets.toml
 
