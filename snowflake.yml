@@ -6,7 +6,7 @@ entities:
       name: CORTEX_CODE_CONSUMPTION_DASHBOARD
       database: CORTEX_CODE_DASHBOARD
       schema: PUBLIC
-    query_warehouse: COMPUTE_G2_M
+    query_warehouse: COMPUTE_G2_S
     runtime_name: SYSTEM$ST_CONTAINER_RUNTIME_PY3_11
     compute_pool: STREAMLIT_COMPUTE_POOL
     external_access_integrations:
