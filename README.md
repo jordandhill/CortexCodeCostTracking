@@ -1,22 +1,27 @@
 # Snowflake AI Spend Dashboard
 
-A Streamlit dashboard for monitoring credit consumption, cost estimation, and usage analytics across all Snowflake AI products — Cortex Code, AI Functions, Cortex Search, Cortex Analyst, Cortex Agents, and Snowflake Intelligence.
+A Streamlit dashboard for monitoring credit consumption, cost estimation, and usage analytics across all Snowflake AI products — Cortex Code (CLI, Snowsight, Desktop), AI Functions, Cortex Search, Cortex Analyst, Cortex Agents, Snowflake Intelligence, Document Processing, Fine-Tuning, Provisioned Throughput, REST API, and AISQL.
 
 ![Streamlit](https://img.shields.io/badge/Streamlit-FF4B4B?logo=streamlit&logoColor=white)
 ![Snowflake](https://img.shields.io/badge/Snowflake-29B5E8?logo=snowflake&logoColor=white)
 
 ## Features
 
-### Multi-Product Coverage (8 Tabs)
+### Multi-Product Coverage (13 Tabs)
 
 | Tab | Description |
 |-----|-------------|
 | **Overview** | Aggregated metrics across all AI products, combined daily stacked bar chart, chargeback table by user |
-| **Cortex Code** | Credits, cost, users, model-level breakdown, and detail sub-tabs |
+| **Cortex Code** | Credits, cost, users, model-level breakdown, and detail sub-tabs (CLI, Snowsight, and Desktop sources) |
 | **AI Functions** | Usage by function, model, and user with daily trend charts |
-| **Cortex Search** | Per-service credit consumption (no user attribution) |
+| **Cortex Search** | Per-service serving credits plus indexing/daily consumption by type (no user attribution) |
 | **Cortex Analyst** | Per-user credits and requests with avg cost/request |
 | **Agents & SI** | Cortex Agents and Snowflake Intelligence usage by user and resource |
+| **Doc Processing** | AI_PARSE_DOCUMENT / AI_EXTRACT file processing by function and model (per-service) |
+| **Fine-Tuning** | Model fine-tuning credits and tokens by model (per-service) |
+| **REST API** | Cortex REST API token volume by user and model (tokens only — no credits column) |
+| **Prov. Throughput** | Reserved PTU capacity credits by AI service and model |
+| **AISQL** | AISQL query usage — shown standalone, excluded from grand total to avoid double-counting with AI Functions |
 | **Cost Estimator** | Configurable workload forecaster for all products with donut chart breakdown |
 | **Pricing Reference** | Built-in credit table with live refresh via `AI_PARSE_DOCUMENT`, observed vs. published rate comparison |
 
@@ -34,17 +39,30 @@ A Streamlit dashboard for monitoring credit consumption, cost estimation, and us
 
 ## Data Sources
 
-This dashboard reads from six `SNOWFLAKE.ACCOUNT_USAGE` views:
+This dashboard reads from the following `SNOWFLAKE.ACCOUNT_USAGE` views:
 
 | View | Product | User Attribution |
 |------|---------|-----------------|
-| `CORTEX_CODE_CLI_USAGE_HISTORY` | Cortex Code (CLI) | Yes (via `USER_ID`) |
-| `CORTEX_CODE_SNOWSIGHT_USAGE_HISTORY` | Cortex Code (Snowsight) | Yes (via `USER_ID`) |
+| `CORTEX_CODE_CLI_USAGE_HISTORY` | Cortex Code (CLI) | Yes (via `USER_NAME`) |
+| `CORTEX_CODE_SNOWSIGHT_USAGE_HISTORY` | Cortex Code (Snowsight) | Yes (via `USER_NAME`) |
+| `CORTEX_CODE_DESKTOP_USAGE_HISTORY` | Cortex Code (Desktop) | Yes (via `USER_NAME`) |
 | `CORTEX_AI_FUNCTIONS_USAGE_HISTORY` | AI Functions | Yes (via `USER_ID`) |
-| `CORTEX_SEARCH_SERVING_USAGE_HISTORY` | Cortex Search | No (per-service only) |
+| `CORTEX_SEARCH_SERVING_USAGE_HISTORY` | Cortex Search (serving) | No (per-service only) |
+| `CORTEX_SEARCH_DAILY_USAGE_HISTORY` | Cortex Search (indexing/daily) | No (per-service, by consumption type) |
 | `CORTEX_ANALYST_USAGE_HISTORY` | Cortex Analyst | Yes (via `USERNAME`) |
 | `CORTEX_AGENT_USAGE_HISTORY` | Cortex Agents | Yes (via `USER_NAME`) |
 | `SNOWFLAKE_INTELLIGENCE_USAGE_HISTORY` | Snowflake Intelligence | Yes (via `USER_NAME`) |
+| `CORTEX_DOCUMENT_PROCESSING_USAGE_HISTORY` | Document Processing | No (per-service only) |
+| `CORTEX_FINE_TUNING_USAGE_HISTORY` | Fine-Tuning | No (per-service only) |
+| `CORTEX_REST_API_USAGE_HISTORY` | Cortex REST API | Yes (via `USER_ID`) — tokens only, no credits |
+| `CORTEX_PROVISIONED_THROUGHPUT_USAGE_HISTORY` | Provisioned Throughput | No (per-service only) |
+| `CORTEX_AISQL_USAGE_HISTORY` | AISQL | Standalone (excluded from grand total) |
+
+> **Cortex Code sources:** The three Cortex Code views (CLI, Snowsight, Desktop) cover distinct entry points and are mutually exclusive — combine all three for total Cortex Code usage. These views now expose `USER_NAME` directly, so no join to `USERS` is needed.
+>
+> **AISQL vs AI Functions:** `CORTEX_AISQL_USAGE_HISTORY` may overlap with `CORTEX_AI_FUNCTIONS_USAGE_HISTORY`. AI Functions is treated as canonical; AISQL is surfaced in its own tab and excluded from the Overview grand total to avoid double-counting.
+>
+> **REST API:** This view reports `TOKENS` only and has no credits column, so the REST API tab shows token volume (no dollar cost).
 
 ### Access Requirements
 
@@ -135,7 +153,7 @@ Built-in defaults are in `CORTEX_CODE_PRICING`. These can be refreshed at runtim
 ## Project Structure
 
 ```
-├── streamlit_app.py       # Main application (~1400 lines)
+├── streamlit_app.py       # Main application (~1900 lines)
 ├── snowflake.yml          # Snowflake CLI project definition (definition_version: 2)
 ├── pyproject.toml         # Python dependencies for SiS
 ├── deploy.sh              # Deployment script
@@ -150,7 +168,8 @@ Built-in defaults are in `CORTEX_CODE_PRICING`. These can be refreshed at runtim
 | Issue | Solution |
 |-------|----------|
 | "No Cortex Code usage data found" | Ensure your role has `IMPORTED PRIVILEGES` on the `SNOWFLAKE` database |
-| Only CLI data shown | `CORTEX_CODE_SNOWSIGHT_USAGE_HISTORY` may not yet be available in your account |
+| Only CLI data shown | `CORTEX_CODE_SNOWSIGHT_USAGE_HISTORY` / `CORTEX_CODE_DESKTOP_USAGE_HISTORY` may not yet be available in your account |
+| A product tab shows "No data" | That view may be unavailable or have no usage yet; each loader fails silently and is skipped |
 | PDF refresh fails with 403 | Snowflake's CDN may block downloads; use the manual stage upload method |
 | Connection errors | Verify `~/.snowflake/connections.toml`; set `SNOWFLAKE_CONNECTION_NAME` |
 | Data appears stale | `ACCOUNT_USAGE` has up to 45-min latency; cached data refreshes every 10 minutes |

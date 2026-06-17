@@ -31,7 +31,11 @@ st.set_page_config(
 
 TIME_RANGES = ["Last 30 days", "Last 90 days", "Last 6 months", "Last 12 months", "YTD", "All"]
 CHART_HEIGHT = 350
-SOURCES = {"CLI": "CORTEX_CODE_CLI_USAGE_HISTORY", "Snowsight": "CORTEX_CODE_SNOWSIGHT_USAGE_HISTORY"}
+SOURCES = {
+    "CLI": "CORTEX_CODE_CLI_USAGE_HISTORY",
+    "Snowsight": "CORTEX_CODE_SNOWSIGHT_USAGE_HISTORY",
+    "Desktop": "CORTEX_CODE_DESKTOP_USAGE_HISTORY",
+}
 
 CREDIT_PRICE_TIERS = {
     "Global ($2.00) — effective Apr 1, 2026": 2.00,
@@ -245,14 +249,13 @@ def load_usage_data() -> pd.DataFrame:
         try:
             df = run_query(f"""
                 SELECT
-                    u.NAME AS user_name,
+                    c.USER_NAME AS user_name,
                     '{label}' AS source,
                     DATE_TRUNC('day', c.USAGE_TIME)::DATE AS usage_date,
                     c.TOKEN_CREDITS,
                     c.TOKENS,
                     c.REQUEST_ID
                 FROM SNOWFLAKE.ACCOUNT_USAGE.{view} c
-                LEFT JOIN SNOWFLAKE.ACCOUNT_USAGE.USERS u ON c.USER_ID = u.USER_ID
             """)
             df["token_credits"] = df["token_credits"].astype(float)
             df["tokens"] = df["tokens"].astype(float)
@@ -272,7 +275,7 @@ def load_granular_data() -> pd.DataFrame:
         try:
             df = run_query(f"""
                 SELECT
-                    u.NAME AS user_name,
+                    c.USER_NAME AS user_name,
                     '{label}' AS source,
                     DATE_TRUNC('day', c.USAGE_TIME)::DATE AS usage_date,
                     c.REQUEST_ID,
@@ -285,8 +288,7 @@ def load_granular_data() -> pd.DataFrame:
                     g.value:cache_read_input::FLOAT AS cache_read_credits,
                     g.value:cache_write_input::FLOAT AS cache_write_credits,
                     g.value:output::FLOAT AS output_credits
-                FROM SNOWFLAKE.ACCOUNT_USAGE.{view} c
-                LEFT JOIN SNOWFLAKE.ACCOUNT_USAGE.USERS u ON c.USER_ID = u.USER_ID,
+                FROM SNOWFLAKE.ACCOUNT_USAGE.{view} c,
                 LATERAL FLATTEN(c.TOKENS_GRANULAR) f,
                 LATERAL FLATTEN(c.CREDITS_GRANULAR) g
                 WHERE f.key = g.key
@@ -394,6 +396,131 @@ def load_agents_data() -> pd.DataFrame:
         return pd.DataFrame()
 
 
+@st.cache_data(ttl=600, show_spinner="Loading Document Processing data...")
+def load_doc_processing_data() -> pd.DataFrame:
+    try:
+        df = run_query("""
+            SELECT
+                DATE_TRUNC('day', START_TIME)::DATE AS usage_date,
+                COALESCE(FUNCTION_NAME, 'Unknown') AS function_name,
+                COALESCE(MODEL_NAME, 'N/A') AS model_name,
+                SUM(CREDITS_USED) AS credits,
+                SUM(COALESCE(DOCUMENT_COUNT, 0)) AS documents,
+                SUM(COALESCE(PAGE_COUNT, 0)) AS pages,
+                COUNT(*) AS calls
+            FROM SNOWFLAKE.ACCOUNT_USAGE.CORTEX_DOCUMENT_PROCESSING_USAGE_HISTORY
+            GROUP BY 1, 2, 3
+        """)
+        for col in ["credits", "documents", "pages", "calls"]:
+            df[col] = df[col].fillna(0).astype(float)
+        return df
+    except Exception:
+        return pd.DataFrame()
+
+
+@st.cache_data(ttl=600, show_spinner="Loading Fine-Tuning data...")
+def load_fine_tuning_data() -> pd.DataFrame:
+    try:
+        df = run_query("""
+            SELECT
+                DATE_TRUNC('day', START_TIME)::DATE AS usage_date,
+                COALESCE(MODEL_NAME, 'N/A') AS model_name,
+                SUM(TOKEN_CREDITS) AS credits,
+                SUM(TOKENS) AS tokens
+            FROM SNOWFLAKE.ACCOUNT_USAGE.CORTEX_FINE_TUNING_USAGE_HISTORY
+            GROUP BY 1, 2
+        """)
+        df["credits"] = df["credits"].fillna(0).astype(float)
+        df["tokens"] = df["tokens"].fillna(0).astype(float)
+        return df
+    except Exception:
+        return pd.DataFrame()
+
+
+@st.cache_data(ttl=600, show_spinner="Loading Cortex REST API data...")
+def load_rest_api_data() -> pd.DataFrame:
+    try:
+        df = run_query("""
+            SELECT
+                DATE_TRUNC('day', r.START_TIME)::DATE AS usage_date,
+                COALESCE(u.NAME, 'Unknown') AS user_name,
+                COALESCE(r.MODEL_NAME, 'N/A') AS model_name,
+                COALESCE(r.INFERENCE_REGION, 'N/A') AS inference_region,
+                SUM(r.TOKENS) AS tokens,
+                COUNT(*) AS requests
+            FROM SNOWFLAKE.ACCOUNT_USAGE.CORTEX_REST_API_USAGE_HISTORY r
+            LEFT JOIN SNOWFLAKE.ACCOUNT_USAGE.USERS u ON r.USER_ID = u.USER_ID
+            GROUP BY 1, 2, 3, 4
+        """)
+        df["tokens"] = df["tokens"].fillna(0).astype(float)
+        df["requests"] = df["requests"].fillna(0).astype(float)
+        return df
+    except Exception:
+        return pd.DataFrame()
+
+
+@st.cache_data(ttl=600, show_spinner="Loading Provisioned Throughput data...")
+def load_provisioned_throughput_data() -> pd.DataFrame:
+    try:
+        df = run_query("""
+            SELECT
+                DATE_TRUNC('day', INTERVAL_START_TIME)::DATE AS usage_date,
+                COALESCE(AI_SERVICE, 'Unknown') AS ai_service,
+                COALESCE(MODEL_NAME, 'N/A') AS model_name,
+                SUM(PTU_CREDITS) AS credits,
+                SUM(COALESCE(PTU_COUNT, 0)) AS ptu_count
+            FROM SNOWFLAKE.ACCOUNT_USAGE.CORTEX_PROVISIONED_THROUGHPUT_USAGE_HISTORY
+            GROUP BY 1, 2, 3
+        """)
+        df["credits"] = df["credits"].fillna(0).astype(float)
+        df["ptu_count"] = df["ptu_count"].fillna(0).astype(float)
+        return df
+    except Exception:
+        return pd.DataFrame()
+
+
+@st.cache_data(ttl=600, show_spinner="Loading Cortex Search indexing data...")
+def load_search_indexing_data() -> pd.DataFrame:
+    try:
+        df = run_query("""
+            SELECT
+                DATE_TRUNC('day', USAGE_DATE)::DATE AS usage_date,
+                DATABASE_NAME AS database_name,
+                SCHEMA_NAME AS schema_name,
+                SERVICE_NAME AS service_name,
+                COALESCE(CONSUMPTION_TYPE, 'Unknown') AS consumption_type,
+                SUM(CREDITS) AS credits
+            FROM SNOWFLAKE.ACCOUNT_USAGE.CORTEX_SEARCH_DAILY_USAGE_HISTORY
+            GROUP BY 1, 2, 3, 4, 5
+        """)
+        df["credits"] = df["credits"].fillna(0).astype(float)
+        return df
+    except Exception:
+        return pd.DataFrame()
+
+
+@st.cache_data(ttl=600, show_spinner="Loading AISQL data...")
+def load_aisql_data() -> pd.DataFrame:
+    try:
+        df = run_query("""
+            SELECT
+                DATE_TRUNC('day', USAGE_TIME)::DATE AS usage_date,
+                COALESCE(FUNCTION_NAME, 'Unknown') AS function_name,
+                COALESCE(MODEL_NAME, 'N/A') AS model_name,
+                SUM(TOKEN_CREDITS) AS credits,
+                SUM(TOKENS) AS tokens,
+                COUNT(*) AS calls
+            FROM SNOWFLAKE.ACCOUNT_USAGE.CORTEX_AISQL_USAGE_HISTORY
+            GROUP BY 1, 2, 3
+        """)
+        df["credits"] = df["credits"].fillna(0).astype(float)
+        df["tokens"] = df["tokens"].fillna(0).astype(float)
+        df["calls"] = df["calls"].fillna(0).astype(float)
+        return df
+    except Exception:
+        return pd.DataFrame()
+
+
 if not IS_SIS:
     get_conn()
 
@@ -488,20 +615,39 @@ aifn_raw = load_ai_functions_data()
 search_raw = load_cortex_search_data()
 analyst_raw = load_cortex_analyst_data()
 agents_raw = load_agents_data()
+docproc_raw = load_doc_processing_data()
+finetune_raw = load_fine_tuning_data()
+restapi_raw = load_rest_api_data()
+ptu_raw = load_provisioned_throughput_data()
+search_idx_raw = load_search_indexing_data()
+aisql_raw = load_aisql_data()
 
 aifn_filtered = filter_by_time_range(aifn_raw, "usage_date", time_range) if not aifn_raw.empty else pd.DataFrame()
 search_filtered = filter_by_time_range(search_raw, "usage_date", time_range) if not search_raw.empty else pd.DataFrame()
 analyst_filtered = filter_by_time_range(analyst_raw, "usage_date", time_range) if not analyst_raw.empty else pd.DataFrame()
 agents_filtered = filter_by_time_range(agents_raw, "usage_date", time_range) if not agents_raw.empty else pd.DataFrame()
+docproc_filtered = filter_by_time_range(docproc_raw, "usage_date", time_range) if not docproc_raw.empty else pd.DataFrame()
+finetune_filtered = filter_by_time_range(finetune_raw, "usage_date", time_range) if not finetune_raw.empty else pd.DataFrame()
+restapi_filtered = filter_by_time_range(restapi_raw, "usage_date", time_range) if not restapi_raw.empty else pd.DataFrame()
+ptu_filtered = filter_by_time_range(ptu_raw, "usage_date", time_range) if not ptu_raw.empty else pd.DataFrame()
+search_idx_filtered = filter_by_time_range(search_idx_raw, "usage_date", time_range) if not search_idx_raw.empty else pd.DataFrame()
+aisql_filtered = filter_by_time_range(aisql_raw, "usage_date", time_range) if not aisql_raw.empty else pd.DataFrame()
 
 total_credits_aifn = aifn_filtered["credits"].sum() if not aifn_filtered.empty else 0.0
 total_cost_aifn = total_credits_aifn * customer_credit_price
 total_credits_search = search_filtered["credits"].sum() if not search_filtered.empty else 0.0
 total_credits_analyst = analyst_filtered["credits"].sum() if not analyst_filtered.empty else 0.0
 total_credits_agents = agents_filtered["credits"].sum() if not agents_filtered.empty else 0.0
+total_credits_docproc = docproc_filtered["credits"].sum() if not docproc_filtered.empty else 0.0
+total_credits_finetune = finetune_filtered["credits"].sum() if not finetune_filtered.empty else 0.0
+total_credits_ptu = ptu_filtered["credits"].sum() if not ptu_filtered.empty else 0.0
+total_credits_search_idx = search_idx_filtered["credits"].sum() if not search_idx_filtered.empty else 0.0
+total_tokens_restapi = restapi_filtered["tokens"].sum() if not restapi_filtered.empty else 0.0
+total_credits_aisql = aisql_filtered["credits"].sum() if not aisql_filtered.empty else 0.0
 
 
 (tab_overview, tab_code, tab_aifn, tab_search, tab_analyst, tab_agents,
+ tab_docproc, tab_finetune, tab_restapi, tab_ptu, tab_aisql,
  tab_estimator, tab_pricing) = st.tabs([
     ":material/dashboard: Overview",
     ":material/code: Cortex Code",
@@ -509,6 +655,11 @@ total_credits_agents = agents_filtered["credits"].sum() if not agents_filtered.e
     ":material/search: Cortex Search",
     ":material/analytics: Cortex Analyst",
     ":material/smart_toy: Agents & SI",
+    ":material/description: Doc Processing",
+    ":material/tune: Fine-Tuning",
+    ":material/api: REST API",
+    ":material/memory: Prov. Throughput",
+    ":material/database: AISQL",
     ":material/calculate: Cost Estimator",
     ":material/price_check: Pricing Reference",
 ])
@@ -525,9 +676,29 @@ def render_overview():
     ov4.metric("Cortex Analyst", f"{total_credits_analyst:,.1f} cr", f"${total_credits_analyst * price_per_credit:,.2f}")
     ov5.metric("Agents & SI", f"{total_credits_agents:,.1f} cr", f"${total_credits_agents * price_per_credit:,.2f}")
 
-    total_all_credits = total_credits_code + total_credits_aifn + total_credits_search + total_credits_analyst + total_credits_agents
-    total_all_cost = total_cost_code + total_cost_aifn + (total_credits_search + total_credits_analyst + total_credits_agents) * price_per_credit
+    ov6, ov7, ov8, ov9, ov10 = st.columns(5)
+    ov6.metric("Doc Processing", f"{total_credits_docproc:,.1f} cr", f"${total_credits_docproc * price_per_credit:,.2f}")
+    ov7.metric("Fine-Tuning", f"{total_credits_finetune:,.1f} cr", f"${total_credits_finetune * price_per_credit:,.2f}")
+    ov8.metric("Search Indexing", f"{total_credits_search_idx:,.1f} cr", f"${total_credits_search_idx * price_per_credit:,.2f}")
+    ov9.metric("Prov. Throughput", f"{total_credits_ptu:,.1f} cr", f"${total_credits_ptu * price_per_credit:,.2f}")
+    ov10.metric("REST API", f"{total_tokens_restapi:,.0f} tok", "tokens only")
+
+    total_all_credits = (
+        total_credits_code + total_credits_aifn + total_credits_search + total_credits_analyst
+        + total_credits_agents + total_credits_docproc + total_credits_finetune
+        + total_credits_search_idx + total_credits_ptu
+    )
+    total_all_cost = (
+        total_cost_code + total_cost_aifn
+        + (total_credits_search + total_credits_analyst + total_credits_agents
+           + total_credits_docproc + total_credits_finetune + total_credits_search_idx
+           + total_credits_ptu) * price_per_credit
+    )
     st.caption(f"**Total across all AI products:** {total_all_credits:,.1f} credits — **${total_all_cost:,.2f}** estimated cost")
+    st.caption(
+        ":material/info: Excludes REST API (tokens-only, no credits column) and AISQL "
+        "(shown separately to avoid double-counting with AI Functions)."
+    )
 
     st.divider()
 
@@ -556,6 +727,26 @@ def render_overview():
         agents_agg["usage_date"] = pd.to_datetime(agents_agg["usage_date"])
         agents_agg["product"] = "Agents & SI"
         combined_parts.append(agents_agg)
+    if not docproc_filtered.empty:
+        docproc_agg = docproc_filtered.groupby("usage_date")["credits"].sum().reset_index()
+        docproc_agg["usage_date"] = pd.to_datetime(docproc_agg["usage_date"])
+        docproc_agg["product"] = "Doc Processing"
+        combined_parts.append(docproc_agg)
+    if not finetune_filtered.empty:
+        finetune_agg = finetune_filtered.groupby("usage_date")["credits"].sum().reset_index()
+        finetune_agg["usage_date"] = pd.to_datetime(finetune_agg["usage_date"])
+        finetune_agg["product"] = "Fine-Tuning"
+        combined_parts.append(finetune_agg)
+    if not search_idx_filtered.empty:
+        search_idx_agg = search_idx_filtered.groupby("usage_date")["credits"].sum().reset_index()
+        search_idx_agg["usage_date"] = pd.to_datetime(search_idx_agg["usage_date"])
+        search_idx_agg["product"] = "Search Indexing"
+        combined_parts.append(search_idx_agg)
+    if not ptu_filtered.empty:
+        ptu_agg = ptu_filtered.groupby("usage_date")["credits"].sum().reset_index()
+        ptu_agg["usage_date"] = pd.to_datetime(ptu_agg["usage_date"])
+        ptu_agg["product"] = "Prov. Throughput"
+        combined_parts.append(ptu_agg)
 
     if combined_parts:
         combined_daily = pd.concat(combined_parts, ignore_index=True)
@@ -1024,6 +1215,33 @@ def render_cortex_search():
                 "Est. cost ($)": st.column_config.NumberColumn(format="$%.2f"),
             })
 
+    if not search_idx_filtered.empty:
+        st.divider()
+        st.subheader("Indexing & serving by consumption type")
+        st.caption(
+            "From `CORTEX_SEARCH_DAILY_USAGE_HISTORY` — captures indexing/embedding and other daily "
+            "consumption not reflected in the per-query serving view above."
+        )
+        m1, m2 = st.columns(2)
+        m1.metric("Total credits", f"{total_credits_search_idx:,.1f}")
+        m2.metric("Estimated cost", f"${total_credits_search_idx * price_per_credit:,.2f}")
+        idx_summary = (
+            search_idx_filtered.groupby(["consumption_type", "database_name", "schema_name", "service_name"])
+            .agg(credits=("credits", "sum"))
+            .reset_index()
+            .sort_values("credits", ascending=False)
+        )
+        idx_summary["Est. cost ($)"] = idx_summary["credits"] * price_per_credit
+        idx_summary = idx_summary.rename(columns={
+            "consumption_type": "Consumption type", "database_name": "Database",
+            "schema_name": "Schema", "service_name": "Service", "credits": "Credits",
+        })
+        st.dataframe(idx_summary, use_container_width=True, hide_index=True,
+            column_config={
+                "Credits": st.column_config.NumberColumn(format="%.1f"),
+                "Est. cost ($)": st.column_config.NumberColumn(format="$%.2f"),
+            })
+
 with tab_search:
     render_cortex_search()
 
@@ -1170,6 +1388,299 @@ def render_agents():
 
 with tab_agents:
     render_agents()
+
+
+@st.fragment
+def render_doc_processing():
+    if docproc_filtered.empty:
+        st.info("No Document Processing usage data found in `SNOWFLAKE.ACCOUNT_USAGE.CORTEX_DOCUMENT_PROCESSING_USAGE_HISTORY`.")
+        return
+    m1, m2, m3 = st.columns(3)
+    m1.metric("Total credits", f"{total_credits_docproc:,.1f}")
+    m2.metric("Estimated cost", f"${total_credits_docproc * price_per_credit:,.2f}")
+    m3.metric("Documents", f"{docproc_filtered['documents'].sum():,.0f}")
+    st.caption("Document Processing (AI_PARSE_DOCUMENT / AI_EXTRACT on files) is billed per-service; user-level attribution is not available from `ACCOUNT_USAGE`.")
+
+    st.subheader("Daily credits by function")
+    dp_daily = (
+        docproc_filtered.groupby(["usage_date", "function_name"])
+        .agg(credits=("credits", "sum"))
+        .reset_index()
+    )
+    dp_daily["usage_date"] = pd.to_datetime(dp_daily["usage_date"])
+    dp_chart = (
+        alt.Chart(dp_daily)
+        .mark_bar()
+        .encode(
+            x=alt.X("usage_date:T", title=None),
+            y=alt.Y("credits:Q", title="Credits"),
+            color=alt.Color("function_name:N", legend=alt.Legend(orient="bottom", title="Function")),
+            tooltip=[
+                alt.Tooltip("usage_date:T", title="Date", format="%Y-%m-%d"),
+                alt.Tooltip("function_name:N", title="Function"),
+                alt.Tooltip("credits:Q", title="Credits", format=",.1f"),
+            ],
+        )
+        .properties(height=CHART_HEIGHT)
+    )
+    st.altair_chart(dp_chart, use_container_width=True)
+
+    st.subheader("By function & model")
+    dp_summary = (
+        docproc_filtered.groupby(["function_name", "model_name"])
+        .agg(credits=("credits", "sum"), documents=("documents", "sum"),
+             pages=("pages", "sum"), calls=("calls", "sum"))
+        .reset_index()
+        .sort_values("credits", ascending=False)
+    )
+    dp_summary["Est. cost ($)"] = dp_summary["credits"] * price_per_credit
+    dp_summary = dp_summary.rename(columns={
+        "function_name": "Function", "model_name": "Model", "credits": "Credits",
+        "documents": "Documents", "pages": "Pages", "calls": "Calls",
+    })
+    st.dataframe(dp_summary, use_container_width=True, hide_index=True,
+        column_config={
+            "Credits": st.column_config.NumberColumn(format="%.1f"),
+            "Est. cost ($)": st.column_config.NumberColumn(format="$%.2f"),
+            "Documents": st.column_config.NumberColumn(format="%,.0f"),
+            "Pages": st.column_config.NumberColumn(format="%,.0f"),
+            "Calls": st.column_config.NumberColumn(format="%,.0f"),
+        })
+
+with tab_docproc:
+    render_doc_processing()
+
+
+@st.fragment
+def render_fine_tuning():
+    if finetune_filtered.empty:
+        st.info("No Fine-Tuning usage data found in `SNOWFLAKE.ACCOUNT_USAGE.CORTEX_FINE_TUNING_USAGE_HISTORY`.")
+        return
+    m1, m2, m3 = st.columns(3)
+    m1.metric("Total credits", f"{total_credits_finetune:,.1f}")
+    m2.metric("Estimated cost", f"${total_credits_finetune * price_per_credit:,.2f}")
+    m3.metric("Total tokens", f"{finetune_filtered['tokens'].sum():,.0f}")
+    st.caption("Fine-Tuning is billed per-service; user-level attribution is not available from `ACCOUNT_USAGE`.")
+
+    st.subheader("Daily credits by model")
+    ft_daily = (
+        finetune_filtered.groupby(["usage_date", "model_name"])
+        .agg(credits=("credits", "sum"))
+        .reset_index()
+    )
+    ft_daily["usage_date"] = pd.to_datetime(ft_daily["usage_date"])
+    ft_chart = (
+        alt.Chart(ft_daily)
+        .mark_bar()
+        .encode(
+            x=alt.X("usage_date:T", title=None),
+            y=alt.Y("credits:Q", title="Credits"),
+            color=alt.Color("model_name:N", legend=alt.Legend(orient="bottom", title="Model")),
+            tooltip=[
+                alt.Tooltip("usage_date:T", title="Date", format="%Y-%m-%d"),
+                alt.Tooltip("model_name:N", title="Model"),
+                alt.Tooltip("credits:Q", title="Credits", format=",.1f"),
+            ],
+        )
+        .properties(height=CHART_HEIGHT)
+    )
+    st.altair_chart(ft_chart, use_container_width=True)
+
+    st.subheader("By model")
+    ft_summary = (
+        finetune_filtered.groupby("model_name")
+        .agg(credits=("credits", "sum"), tokens=("tokens", "sum"))
+        .reset_index()
+        .sort_values("credits", ascending=False)
+    )
+    ft_summary["Est. cost ($)"] = ft_summary["credits"] * price_per_credit
+    ft_summary = ft_summary.rename(columns={
+        "model_name": "Model", "credits": "Credits", "tokens": "Tokens",
+    })
+    st.dataframe(ft_summary, use_container_width=True, hide_index=True,
+        column_config={
+            "Credits": st.column_config.NumberColumn(format="%.1f"),
+            "Est. cost ($)": st.column_config.NumberColumn(format="$%.2f"),
+            "Tokens": st.column_config.NumberColumn(format="%,.0f"),
+        })
+
+with tab_finetune:
+    render_fine_tuning()
+
+
+@st.fragment
+def render_rest_api():
+    if restapi_filtered.empty:
+        st.info("No Cortex REST API usage data found in `SNOWFLAKE.ACCOUNT_USAGE.CORTEX_REST_API_USAGE_HISTORY`.")
+        return
+    m1, m2 = st.columns(2)
+    m1.metric("Total tokens", f"{total_tokens_restapi:,.0f}")
+    m2.metric("Total requests", f"{restapi_filtered['requests'].sum():,.0f}")
+    st.info("The REST API usage view reports **tokens only** — it does not expose a credits column. Credit/cost figures are not shown here; refer to AI Functions / model inference rates in the Pricing Reference tab.")
+
+    st.subheader("Daily tokens by model")
+    ra_daily = (
+        restapi_filtered.groupby(["usage_date", "model_name"])
+        .agg(tokens=("tokens", "sum"))
+        .reset_index()
+    )
+    ra_daily["usage_date"] = pd.to_datetime(ra_daily["usage_date"])
+    ra_chart = (
+        alt.Chart(ra_daily)
+        .mark_bar()
+        .encode(
+            x=alt.X("usage_date:T", title=None),
+            y=alt.Y("tokens:Q", title="Tokens"),
+            color=alt.Color("model_name:N", legend=alt.Legend(orient="bottom", title="Model")),
+            tooltip=[
+                alt.Tooltip("usage_date:T", title="Date", format="%Y-%m-%d"),
+                alt.Tooltip("model_name:N", title="Model"),
+                alt.Tooltip("tokens:Q", title="Tokens", format=",.0f"),
+            ],
+        )
+        .properties(height=CHART_HEIGHT)
+    )
+    st.altair_chart(ra_chart, use_container_width=True)
+
+    st.subheader("By user & model")
+    ra_summary = (
+        restapi_filtered.groupby(["user_name", "model_name", "inference_region"])
+        .agg(tokens=("tokens", "sum"), requests=("requests", "sum"))
+        .reset_index()
+        .sort_values("tokens", ascending=False)
+    )
+    ra_summary = ra_summary.rename(columns={
+        "user_name": "User", "model_name": "Model",
+        "inference_region": "Inference region", "tokens": "Tokens", "requests": "Requests",
+    })
+    st.dataframe(ra_summary, use_container_width=True, hide_index=True,
+        column_config={
+            "Tokens": st.column_config.NumberColumn(format="%,.0f"),
+            "Requests": st.column_config.NumberColumn(format="%,.0f"),
+        })
+
+with tab_restapi:
+    render_rest_api()
+
+
+@st.fragment
+def render_provisioned_throughput():
+    if ptu_filtered.empty:
+        st.info("No Provisioned Throughput usage data found in `SNOWFLAKE.ACCOUNT_USAGE.CORTEX_PROVISIONED_THROUGHPUT_USAGE_HISTORY`.")
+        return
+    m1, m2 = st.columns(2)
+    m1.metric("Total credits", f"{total_credits_ptu:,.1f}")
+    m2.metric("Estimated cost", f"${total_credits_ptu * price_per_credit:,.2f}")
+    st.caption("Provisioned Throughput is billed on reserved PTU capacity over time intervals, not per-request.")
+
+    st.subheader("Daily credits by AI service")
+    pt_daily = (
+        ptu_filtered.groupby(["usage_date", "ai_service"])
+        .agg(credits=("credits", "sum"))
+        .reset_index()
+    )
+    pt_daily["usage_date"] = pd.to_datetime(pt_daily["usage_date"])
+    pt_chart = (
+        alt.Chart(pt_daily)
+        .mark_bar()
+        .encode(
+            x=alt.X("usage_date:T", title=None),
+            y=alt.Y("credits:Q", title="Credits"),
+            color=alt.Color("ai_service:N", legend=alt.Legend(orient="bottom", title="AI service")),
+            tooltip=[
+                alt.Tooltip("usage_date:T", title="Date", format="%Y-%m-%d"),
+                alt.Tooltip("ai_service:N", title="AI service"),
+                alt.Tooltip("credits:Q", title="Credits", format=",.1f"),
+            ],
+        )
+        .properties(height=CHART_HEIGHT)
+    )
+    st.altair_chart(pt_chart, use_container_width=True)
+
+    st.subheader("By service & model")
+    pt_summary = (
+        ptu_filtered.groupby(["ai_service", "model_name"])
+        .agg(credits=("credits", "sum"), ptu_count=("ptu_count", "sum"))
+        .reset_index()
+        .sort_values("credits", ascending=False)
+    )
+    pt_summary["Est. cost ($)"] = pt_summary["credits"] * price_per_credit
+    pt_summary = pt_summary.rename(columns={
+        "ai_service": "AI service", "model_name": "Model",
+        "credits": "Credits", "ptu_count": "PTU count",
+    })
+    st.dataframe(pt_summary, use_container_width=True, hide_index=True,
+        column_config={
+            "Credits": st.column_config.NumberColumn(format="%.1f"),
+            "Est. cost ($)": st.column_config.NumberColumn(format="$%.2f"),
+            "PTU count": st.column_config.NumberColumn(format="%,.0f"),
+        })
+
+with tab_ptu:
+    render_provisioned_throughput()
+
+
+@st.fragment
+def render_aisql():
+    st.caption(
+        "AISQL records AI query usage via `CORTEX_AISQL_USAGE_HISTORY`. This may overlap with "
+        "**AI Functions** (`CORTEX_AI_FUNCTIONS_USAGE_HISTORY`), so it is shown here as a standalone "
+        "detail view and is **excluded from the Overview grand total** to avoid double-counting."
+    )
+    if aisql_filtered.empty:
+        st.info("No AISQL usage data found in `SNOWFLAKE.ACCOUNT_USAGE.CORTEX_AISQL_USAGE_HISTORY`.")
+        return
+    m1, m2, m3 = st.columns(3)
+    m1.metric("Total credits", f"{total_credits_aisql:,.1f}")
+    m2.metric("Estimated cost", f"${total_credits_aisql * price_per_credit:,.2f}")
+    m3.metric("Total calls", f"{aisql_filtered['calls'].sum():,.0f}")
+
+    st.subheader("Daily credits by function")
+    aq_daily = (
+        aisql_filtered.groupby(["usage_date", "function_name"])
+        .agg(credits=("credits", "sum"))
+        .reset_index()
+    )
+    aq_daily["usage_date"] = pd.to_datetime(aq_daily["usage_date"])
+    aq_chart = (
+        alt.Chart(aq_daily)
+        .mark_bar()
+        .encode(
+            x=alt.X("usage_date:T", title=None),
+            y=alt.Y("credits:Q", title="Credits"),
+            color=alt.Color("function_name:N", legend=alt.Legend(orient="bottom", title="Function")),
+            tooltip=[
+                alt.Tooltip("usage_date:T", title="Date", format="%Y-%m-%d"),
+                alt.Tooltip("function_name:N", title="Function"),
+                alt.Tooltip("credits:Q", title="Credits", format=",.1f"),
+            ],
+        )
+        .properties(height=CHART_HEIGHT)
+    )
+    st.altair_chart(aq_chart, use_container_width=True)
+
+    st.subheader("By function & model")
+    aq_summary = (
+        aisql_filtered.groupby(["function_name", "model_name"])
+        .agg(credits=("credits", "sum"), tokens=("tokens", "sum"), calls=("calls", "sum"))
+        .reset_index()
+        .sort_values("credits", ascending=False)
+    )
+    aq_summary["Est. cost ($)"] = aq_summary["credits"] * price_per_credit
+    aq_summary = aq_summary.rename(columns={
+        "function_name": "Function", "model_name": "Model",
+        "credits": "Credits", "tokens": "Tokens", "calls": "Calls",
+    })
+    st.dataframe(aq_summary, use_container_width=True, hide_index=True,
+        column_config={
+            "Credits": st.column_config.NumberColumn(format="%.1f"),
+            "Est. cost ($)": st.column_config.NumberColumn(format="$%.2f"),
+            "Tokens": st.column_config.NumberColumn(format="%,.0f"),
+            "Calls": st.column_config.NumberColumn(format="%,.0f"),
+        })
+
+with tab_aisql:
+    render_aisql()
 
 
 @st.fragment
@@ -1429,5 +1940,7 @@ st.caption(
     f":material/info: Data from `SNOWFLAKE.ACCOUNT_USAGE`. "
     f"Cortex Code sources: {', '.join(available_sources)}. "
     f"AI credit price: **${price_per_credit:.2f}** · Customer credit price: **${customer_credit_price:.2f}**. "
-    "Most AI products use the flat AI credit price. AI Functions bills on traditional credits at the customer rate."
+    "Most AI products use the flat AI credit price; AI Functions bills on traditional credits at the customer rate. "
+    "Coverage: Cortex Code (CLI/Snowsight/Desktop), AI Functions, Cortex Search (serving + indexing), "
+    "Cortex Analyst, Agents & SI, Document Processing, Fine-Tuning, Provisioned Throughput, REST API, and AISQL."
 )

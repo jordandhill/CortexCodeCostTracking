@@ -1,16 +1,16 @@
-# Cortex Code Consumption Dashboard — Specification
+# Snowflake AI Spend Dashboard — Specification
 
-This document fully specifies a Streamlit application that visualizes Snowflake Cortex Code usage, credits, costs, and model-level token breakdowns. An AI coding agent should be able to recreate the app from this spec alone.
+This document specifies a Streamlit application that visualizes Snowflake AI consumption — credits, estimated dollar cost, per-user chargeback, per-model token breakdowns, a workload cost estimator, and a pricing reference with live-refresh capability — across all Snowflake AI products. An AI coding agent should be able to recreate the app from this spec alone.
 
 ---
 
 ## 1. Overview
 
-- **Purpose**: Dashboard for monitoring Cortex Code consumption across an entire Snowflake account — credits spent, estimated dollar cost, per-user breakdowns, per-model token analysis, and a pricing reference with live-refresh capability.
+- **Purpose**: Account-wide dashboard for monitoring Snowflake AI spend across Cortex Code (CLI, Snowsight, Desktop), AI Functions, Cortex Search (serving + indexing), Cortex Analyst, Cortex Agents, Snowflake Intelligence, Document Processing, Fine-Tuning, Provisioned Throughput, Cortex REST API, and AISQL.
 - **Runtime**: Must run in **two environments**:
-  1. **Streamlit in Snowflake (SIS)** — uses Snowpark `get_active_session()` for queries.
+  1. **Streamlit in Snowflake (SiS)** — uses Snowpark `get_active_session()` for queries.
   2. **Local Streamlit** — uses `snowflake.connector` with credentials from `~/.snowflake/connections.toml`.
-- **Layout**: Wide mode, single-page app with sidebar filters and 6 content tabs.
+- **Layout**: Wide mode, single-page app with a top-right date range selector, sidebar settings/filters, and 13 content tabs.
 
 ---
 
@@ -19,19 +19,14 @@ This document fully specifies a Streamlit application that visualizes Snowflake 
 | Package | Min Version | Purpose |
 |---|---|---|
 | `python` | 3.11 | Runtime (required for `tomllib`) |
-| `streamlit` | 1.54.0 | UI framework (with `[snowflake]` extra) |
+| `streamlit[snowflake]` | 1.54.0 | UI framework |
 | `pandas` | 2.0.0 | Data manipulation |
 | `altair` | 5.0.0 | Charting |
 | `snowflake-connector-python` | 3.3.0 | Local Snowflake connectivity |
 
-Conditional imports (local-only, not needed in SIS):
-- `snowflake.connector`
-- `cryptography.hazmat.primitives.serialization` (for key-pair auth)
-- `pathlib.Path`, `tomllib`
+Conditional imports (local-only, not needed in SiS): `snowflake.connector`, `cryptography.hazmat.primitives.serialization`, `pathlib.Path`, `tomllib`.
 
 Standard library: `datetime`, `json`, `os`, `re`, `tempfile`, `urllib.request`.
-
-**`pyproject.toml`** should declare these under `[project] dependencies`.
 
 ---
 
@@ -39,59 +34,40 @@ Standard library: `datetime`, `json`, `os`, `re`, `tempfile`, `urllib.request`.
 
 ### 3.1 Environment Detection
 
-At module load, attempt to import `snowflake.snowpark.context.get_active_session()`. If it succeeds, set `IS_SIS = True` and store the session. If it fails (any exception), set `IS_SIS = False`.
-
-```python
-IS_SIS = False
-_snowpark_session = None
-try:
-    from snowflake.snowpark.context import get_active_session
-    _snowpark_session = get_active_session()
-    IS_SIS = True
-except Exception:
-    pass
-```
+At module load, attempt `from snowflake.snowpark.context import get_active_session`. On success set `IS_SIS = True` and store the session; on any exception set `IS_SIS = False`.
 
 ### 3.2 Local Connection (`get_conn`)
 
-Only defined when `IS_SIS is False`. Decorated with `@st.cache_resource`.
-
-1. Read connection name from env vars: `SNOWFLAKE_CONNECTION_NAME` → `SNOWFLAKE_DEFAULT_CONNECTION_NAME` → `"default"`.
-2. Parse `~/.snowflake/connections.toml` using `tomllib`.
-3. Extract `account`, `user`, `role`, `warehouse` from the named connection.
-4. If `private_key_path` is present, load the PEM key via `cryptography`, convert to DER PKCS8, pass as `private_key`.
-5. Else if `authenticator` is present, pass it through (supports `externalbrowser`, etc.).
-6. Return `snowflake.connector.connect(**kwargs)`.
-7. On failure, show `st.error` + `st.info` and `st.stop()`.
-
-Call `get_conn()` once at module level (guarded by `if not IS_SIS`) to eagerly validate the connection before rendering any UI.
+Only defined when `IS_SIS is False`; decorated with `@st.cache_resource`. Reads the connection name from `SNOWFLAKE_CONNECTION_NAME` → `SNOWFLAKE_DEFAULT_CONNECTION_NAME` → `"default"`, parses `~/.snowflake/connections.toml` via `tomllib`, and connects using key-pair auth (`private_key_path` → DER PKCS8) or `authenticator`. On failure, shows `st.error`/`st.info` and `st.stop()`. Called once at module level (guarded by `if not IS_SIS`).
 
 ### 3.3 Query Helpers
 
-**`run_query(sql: str) -> pd.DataFrame`**: In SIS, uses `_snowpark_session.sql(sql).to_pandas()` and lowercases columns. Locally, uses cursor `.execute()` / `.fetchall()` and builds a DataFrame with lowercased column names.
-
-**`run_scalar(sql: str) -> Any`**: Returns the first column of the first row. In SIS, uses `.collect()[0][0]`. Locally, uses `.fetchone()[0]`.
+- **`run_query(sql) -> pd.DataFrame`**: SiS uses `_snowpark_session.sql(sql).to_pandas()`; local uses cursor `.execute()`/`.fetchall()`. Column names are lowercased in both paths.
+- **`run_scalar(sql)`**: Returns the first column of the first row.
 
 ---
 
 ## 4. Constants & Configuration
 
-### 4.1 Data Sources
+### 4.1 Cortex Code Sources
 
 ```python
 SOURCES = {
     "CLI": "CORTEX_CODE_CLI_USAGE_HISTORY",
     "Snowsight": "CORTEX_CODE_SNOWSIGHT_USAGE_HISTORY",
+    "Desktop": "CORTEX_CODE_DESKTOP_USAGE_HISTORY",
 }
 ```
 
-Both are views in `SNOWFLAKE.ACCOUNT_USAGE`.
+All three are views in `SNOWFLAKE.ACCOUNT_USAGE` with identical schemas, covering distinct (mutually exclusive) Cortex Code entry points. Each exposes `USER_NAME` directly (no join to `USERS` required).
 
 ### 4.2 Time Range Options
 
 ```python
-TIME_RANGES = ["1W", "1M", "3M", "6M", "YTD", "All"]
+TIME_RANGES = ["Last 30 days", "Last 90 days", "Last 6 months", "Last 12 months", "YTD", "All"]
 ```
+
+Rendered as a top-right `st.selectbox` (default index 0 = "Last 30 days").
 
 ### 4.3 Credit Pricing Tiers
 
@@ -102,336 +78,127 @@ CREDIT_PRICE_TIERS = {
 }
 ```
 
-### 4.4 Default Model Pricing (Credits per 1M Tokens)
+The selected tier provides `price_per_credit` (the flat AI credit rate). A separate sidebar `customer_credit_price` (default $3.00) applies to products billed on traditional credits (AI Functions).
 
-Hardcoded fallback pricing for Table 6(g) of the Snowflake Consumption Table:
+### 4.4 Model & Rate Pricing
 
-```python
-CORTEX_CODE_PRICING = {
-    "claude-4-sonnet":    {"input": 1.50, "cache_read_input": 0.15, "cache_write_input": 1.88, "output": 7.50},
-    "claude-opus-4-5":    {"input": 2.75, "cache_read_input": 0.28, "cache_write_input": 3.44, "output": 13.75},
-    "claude-opus-4-6":    {"input": 2.75, "cache_read_input": 0.28, "cache_write_input": 3.44, "output": 13.75},
-    "claude-sonnet-4-5":  {"input": 1.65, "cache_read_input": 0.17, "cache_write_input": 2.07, "output": 8.25},
-    "claude-sonnet-4-6":  {"input": 1.65, "cache_read_input": 0.17, "cache_write_input": 2.07, "output": 8.25},
-    "openai-gpt-5.2":     {"input": 0.97, "cache_read_input": 0.10, "cache_write_input": 0.0,  "output": 7.70},
-    "openai-gpt-5.44":    {"input": 1.38, "cache_read_input": 0.14, "cache_write_input": 0.0,  "output": 8.25},
-}
-```
+- `CORTEX_CODE_PRICING` — Table 6(g) defaults, credits per 1M tokens, keyed by model with `input` / `cache_read_input` / `cache_write_input` / `output`. Verified accurate against observed account rates.
+- `AI_COMPLETE_PRICING` — AI_COMPLETE model rates (estimates) used by the Cost Estimator.
+- `CORTEX_SEARCH_RATE_PER_1K = 0.25`, `CORTEX_ANALYST_RATE_PER_REQUEST = 0.06` — estimator defaults (published rates, subject to change).
 
 ### 4.5 Other Constants
 
 ```python
 CHART_HEIGHT = 350
-PRICING_CHANGE_DATE = date(2026, 4, 1)
 CONSUMPTION_TABLE_URL = "https://www.snowflake.com/legal-files/CreditConsumptionTable.pdf"
 PRICING_STAGE = "CORTEX_CODE_DASHBOARD.PUBLIC.PRICING_DOCS"
-TOKEN_TYPES = ["input", "cache_read", "cache_write", "output"]
-TOKEN_TYPE_LABELS = {
-    "input": "Input",
-    "cache_read": "Cache Read",
-    "cache_write": "Cache Write",
-    "output": "Output",
-}
+TOKEN_TYPE_LABELS = {"input": "Input", "cache_read": "Cache Read", "cache_write": "Cache Write", "output": "Output"}
+AI_FUNCTION_TYPES = [...]  # estimator function-type options
 ```
 
 ---
 
-## 5. Data Loading
+## 5. Data Sources & Loaders
 
-Both loaders use `@st.cache_data(ttl=600)` with a descriptive spinner.
+Every loader uses `@st.cache_data(ttl=600)` with a descriptive spinner and wraps its query in `try/except`, returning an empty DataFrame on failure (so a missing/unavailable view degrades gracefully).
 
-### 5.1 Summary Data (`load_usage_data`)
+| Loader | View(s) | Key columns | Attribution |
+|---|---|---|---|
+| `load_usage_data` | `SOURCES` (CLI/Snowsight/Desktop) | `USER_NAME`, `USAGE_TIME`, `TOKEN_CREDITS`, `TOKENS`, `REQUEST_ID` | `USER_NAME` |
+| `load_granular_data` | `SOURCES` | `TOKENS_GRANULAR`/`CREDITS_GRANULAR` (OBJECT) via `LATERAL FLATTEN` | `USER_NAME` |
+| `load_ai_functions_data` | `CORTEX_AI_FUNCTIONS_USAGE_HISTORY` | `FUNCTION_NAME`, `MODEL_NAME`, `CREDITS`, `USER_ID`→`USERS` | user |
+| `load_cortex_search_data` | `CORTEX_SEARCH_SERVING_USAGE_HISTORY` | `DATABASE_NAME`, `SCHEMA_NAME`, `SERVICE_NAME`, `CREDITS` | per-service |
+| `load_cortex_analyst_data` | `CORTEX_ANALYST_USAGE_HISTORY` | `USERNAME`, `CREDITS`, `REQUEST_COUNT` | user |
+| `load_agents_data` | `CORTEX_AGENT_USAGE_HISTORY` + `SNOWFLAKE_INTELLIGENCE_USAGE_HISTORY` | `USER_NAME`, `AGENT_NAME`/`SNOWFLAKE_INTELLIGENCE_NAME`, `TOKEN_CREDITS`, `TOKENS` | user |
+| `load_doc_processing_data` | `CORTEX_DOCUMENT_PROCESSING_USAGE_HISTORY` | `FUNCTION_NAME`, `MODEL_NAME`, `CREDITS_USED`, `DOCUMENT_COUNT`, `PAGE_COUNT` | per-service |
+| `load_fine_tuning_data` | `CORTEX_FINE_TUNING_USAGE_HISTORY` | `MODEL_NAME`, `TOKEN_CREDITS`, `TOKENS` (uses `START_TIME`) | per-service |
+| `load_rest_api_data` | `CORTEX_REST_API_USAGE_HISTORY` | `MODEL_NAME`, `INFERENCE_REGION`, `TOKENS`, `USER_ID`→`USERS` | user (tokens only, **no credits**) |
+| `load_provisioned_throughput_data` | `CORTEX_PROVISIONED_THROUGHPUT_USAGE_HISTORY` | `AI_SERVICE`, `MODEL_NAME`, `PTU_CREDITS`, `PTU_COUNT` (uses `INTERVAL_START_TIME`) | per-service |
+| `load_search_indexing_data` | `CORTEX_SEARCH_DAILY_USAGE_HISTORY` | `CONSUMPTION_TYPE`, `DATABASE_NAME`, `SCHEMA_NAME`, `SERVICE_NAME`, `CREDITS` (uses `USAGE_DATE`) | per-service |
+| `load_aisql_data` | `CORTEX_AISQL_USAGE_HISTORY` | `FUNCTION_NAME`, `MODEL_NAME`, `TOKEN_CREDITS`, `TOKENS` (uses `USAGE_TIME`) | standalone |
 
-For each source in `SOURCES`, run:
-
-```sql
-SELECT
-    u.NAME AS user_name,
-    '{label}' AS source,
-    DATE_TRUNC('day', c.USAGE_TIME)::DATE AS usage_date,
-    c.TOKEN_CREDITS,
-    c.TOKENS,
-    c.REQUEST_ID
-FROM SNOWFLAKE.ACCOUNT_USAGE.{view} c
-LEFT JOIN SNOWFLAKE.ACCOUNT_USAGE.USERS u ON c.USER_ID = u.USER_ID
-```
-
-- Cast `token_credits` and `tokens` to float.
-- Concatenate results from all sources.
-- If no data at all, show `st.error` about needing ACCOUNTADMIN or USAGE_VIEWER access and `st.stop()`.
-
-### 5.2 Granular Model Data (`load_granular_data`)
-
-For each source in `SOURCES`, run:
-
-```sql
-SELECT
-    u.NAME AS user_name,
-    '{label}' AS source,
-    DATE_TRUNC('day', c.USAGE_TIME)::DATE AS usage_date,
-    c.REQUEST_ID,
-    f.key AS model_name,
-    f.value:input::FLOAT AS input_tokens,
-    f.value:cache_read_input::FLOAT AS cache_read_tokens,
-    f.value:cache_write_input::FLOAT AS cache_write_tokens,
-    f.value:output::FLOAT AS output_tokens,
-    g.value:input::FLOAT AS input_credits,
-    g.value:cache_read_input::FLOAT AS cache_read_credits,
-    g.value:cache_write_input::FLOAT AS cache_write_credits,
-    g.value:output::FLOAT AS output_credits
-FROM SNOWFLAKE.ACCOUNT_USAGE.{view} c
-LEFT JOIN SNOWFLAKE.ACCOUNT_USAGE.USERS u ON c.USER_ID = u.USER_ID,
-LATERAL FLATTEN(c.TOKENS_GRANULAR) f,
-LATERAL FLATTEN(c.CREDITS_GRANULAR) g
-WHERE f.key = g.key
-```
-
-- Fill NaN with 0 and cast all token/credit columns to float.
-- If no data, return empty DataFrame (non-fatal).
+**Schema notes (verified live):** credit column names differ by view (`TOKEN_CREDITS`, `CREDITS`, `CREDITS_USED`, `PTU_CREDITS`); time columns differ (`USAGE_TIME`, `START_TIME`, `INTERVAL_START_TIME`, `USAGE_DATE`). Code-view granular columns are `OBJECT`s keyed by model name whose values contain `input`/`cache_read_input`/`cache_write_input`/`output`.
 
 ---
 
 ## 6. Time Range Filtering
 
-`filter_by_time_range(df, x_col, time_range)` filters a DataFrame by the selected time range:
-
-| Range | Logic |
-|---|---|
-| `1W` | Last 7 days from max date |
-| `1M` | Last 30 days from max date |
-| `3M` | Last 90 days from max date |
-| `6M` | Last 180 days from max date |
-| `YTD` | From January 1 of the max date's year |
-| `All` | No filtering |
+`filter_by_time_range(df, x_col, time_range)` filters by max-date offset: 30/90/180/365 days for the four "Last …" options, Jan 1 of the max year for `YTD`, and no filter for `All`.
 
 ---
 
 ## 7. Page Configuration & Header
 
 ```python
-st.set_page_config(
-    page_title="Cortex Code consumption",
-    page_icon=":material/code:",
-    layout="wide",
-)
+st.set_page_config(page_title="Snowflake AI Spend", page_icon=":material/monitoring:", layout="wide")
 ```
 
-Header row: `st.title("Cortex Code consumption")` on the left (8-col), a **Reset** button on the right (2-col) that clears `st.cache_data`, `st.session_state`, and reruns.
+Header row: `st.title("Snowflake AI Spend")` on the left; the **Date range** `st.selectbox` on the right (label hidden).
 
 ---
 
-## 8. Sidebar Filters
+## 8. Sidebar Settings & Filters
 
 | Control | Type | Default |
 |---|---|---|
-| Credit pricing tier | `st.selectbox` | First tier (Global $2.00) |
-| Time range | `st.selectbox` | "All" |
-| Source | `st.multiselect` | All available sources |
-| Users | `st.multiselect` | All users |
+| AI credit pricing tier | `st.selectbox` | Global ($2.00) |
+| Customer cost per credit ($) | `st.number_input` | 3.00 |
+| Cortex Code Source filter | `st.multiselect` | All available sources |
+| Cortex Code Users filter | `st.multiselect` | All users |
 
-If user deselects everything in Source or Users, reset to "all" (treat empty list as no filter).
-
-Apply filters to both the summary and granular DataFrames.
+Empty multiselects are treated as "select all". Source/User filters apply to the Cortex Code summary and granular DataFrames; the date range applies to every product.
 
 ---
 
-## 9. KPI Metrics Row
+## 9. Tab Structure (13 tabs)
 
-Five `st.metric` widgets across 5 equal columns:
+`Overview`, `Cortex Code`, `AI Functions`, `Cortex Search`, `Cortex Analyst`, `Agents & SI`, `Doc Processing`, `Fine-Tuning`, `REST API`, `Prov. Throughput`, `AISQL`, `Cost Estimator`, `Pricing Reference`. Each tab body is an `@st.fragment` function to avoid full-script reruns on widget interaction.
 
-| Metric | Format | Delta |
-|---|---|---|
-| Total credits | `,.4f` | Change vs. previous period |
-| Estimated cost | `$,.2f` | Change vs. previous period |
-| Requests | `,` (integer) | Change vs. previous period |
-| Active users | plain integer | No delta |
-| Tokens / credit | `,.0f` | Change vs. previous period |
+### 9.1 Overview
 
-**Period-over-period delta logic** (only when time range is not "All"):
-1. Determine the current period's `min_date` and `max_date`.
-2. Calculate `span = max_date - min_date` in days.
-3. Previous period = `[min_date - span - 1 day, min_date - 1 day]`.
-4. Compute the same metrics for the previous period.
-5. Delta = current - previous. Format: credits as `+.4f`, cost as `$+,.2f`, requests as `+,` (signed integer with comma grouping), tokens/credit as `+,.0f`.
-6. If span is 0, deltas are `None`.
+- Two rows of five `st.metric` tiles (credits + estimated cost): Cortex Code, AI Functions, Cortex Search, Cortex Analyst, Agents & SI / Doc Processing, Fine-Tuning, Search Indexing, Prov. Throughput, REST API (tokens-only).
+- **Grand total** caption summing all credit-bearing products. **Excludes** REST API (no credits) and AISQL (avoids double-counting with AI Functions); a second caption states this.
+- Combined daily stacked bar chart (`product` color) across all credit-bearing products.
+- **Chargeback table** — per-user credits/cost across user-attributed products only (Cortex Code, AI Functions, Cortex Analyst, Agents & SI), with CSV export. Per-service products (Search, Doc Processing, Fine-Tuning, Prov. Throughput) are not in chargeback.
+- Cortex Search serving spend-by-service summary.
 
----
+### 9.2 Cortex Code
 
-## 10. Tab Structure
+Sub-tabs: Credits, Cost, Users, Models, Detail. Credits/Cost are daily stacked bars by `source` (now CLI/Snowsight/Desktop). Models uses `granular_filtered`/`model_summary` (token-type stacked bar + summary table). `model_summary` is reused by the Pricing tab's observed-vs-published comparison.
 
-Six tabs with Material icons:
+### 9.3–9.6 AI Functions / Cortex Search / Cortex Analyst / Agents & SI
 
-```python
-[
-    ":material/toll: Credits",
-    ":material/payments: Cost",
-    ":material/group: Users",
-    ":material/model_training: Models",
-    ":material/table: Detail",
-    ":material/price_check: Pricing Reference",
-]
-```
+As previously specified: daily charts plus by-function/model/user/service/resource summary tables. Cortex Search additionally renders an **Indexing & serving by consumption type** section from `CORTEX_SEARCH_DAILY_USAGE_HISTORY` (rendered whenever indexing data exists, independent of serving data).
 
-### 10.1 Daily Aggregation (shared by Credits & Cost tabs)
+### 9.7 Doc Processing / Fine-Tuning / Prov. Throughput / AISQL (new)
 
-Group filtered summary data by `(usage_date, source)`:
-- `credits` = sum of `token_credits`
-- `tokens` = sum of `tokens`
-- `requests` = nunique of `request_id`
-- `cost` = `credits * price_per_credit`
+Each shows metric tiles, a daily credits chart, and a summary table. REST API shows **token volume only** (no dollar cost) with an explanatory `st.info`. AISQL displays a caption noting it is excluded from the grand total.
 
-### 10.2 Credits Tab
+### 9.8 Cost Estimator
 
-Stacked bar chart (Altair):
-- X: `usage_date:T` (no title)
-- Y: `credits:Q` (title: "Credits")
-- Color: `source:N` (legend at bottom)
-- Tooltip: date (`%Y-%m-%d`), source, credits (`,.6f`)
-- Height: `CHART_HEIGHT` (350)
-- Full container width.
+Configurable per-product workload forecaster (developers/requests/tokens/calls), forecast table, KPIs, donut chart, and CSV download. AI Functions use `customer_credit_price`; other products use the AI tier `price_per_credit`.
 
-### 10.3 Cost Tab
+### 9.9 Pricing Reference
 
-Same structure as Credits tab but:
-- Y: `cost:Q` (title: "Estimated cost ($)")
-- Tooltip cost format: `$,.2f`
-
-### 10.4 Users Tab
-
-**Bar chart**: Users on X (sorted descending by cost), estimated cost on Y, colored per user (no legend), rounded top corners (`cornerRadiusTopLeft=4, cornerRadiusTopRight=4`).
-
-Tooltips: User, Credits (`,.6f`), Est. cost (`$,.2f`), Requests (`,`), Tokens/Credit (`,.0f`).
-
-**Data table** below the chart with columns:
-| Column | Format |
-|---|---|
-| User | plain |
-| Credits | `%.6f` |
-| Est. cost ($) | `$%.2f` |
-| Tokens | `%d` |
-| Requests | `%d` |
-| Tokens/Credit | `%,.0f` |
-
-### 10.5 Models Tab
-
-Only renders if the **filtered** granular data (`granular_filtered`) is non-empty. Otherwise shows `st.info`.
-
-**Important**: The `model_summary` DataFrame computed in this tab is also used by the Pricing Reference tab's "observed vs. published rates" section. Since Python `with` blocks do not create new variable scopes, `model_summary` remains accessible outside the `with tab_models:` block. A reimplementation must ensure this variable is available to the Pricing tab.
-
-**Aggregation**: Group granular data by `model_name`. Sum all 8 token/credit columns, nunique `request_id`. Compute `total_tokens`, `total_credits`, `total_cost`, `derived_input_rate`, `derived_output_rate` (credits / tokens * 1M, where tokens > 0).
-
-**Stacked bar chart** ("Credits by model"):
-- Reshape data: for each model and each of the 4 token types, create a row with Model, Token type, Credits, Tokens.
-- X: Model (sorted descending), Y: Credits, Color: Token type (domain = `["Input", "Cache Read", "Cache Write", "Output"]`), legend at bottom.
-
-**Model summary table** with columns:
-| Column | Format |
-|---|---|
-| Model | plain |
-| Requests | `%d` |
-| Total tokens | `%,.0f` |
-| Total credits | `%.6f` |
-| Est. cost ($) | `$%.2f` |
-| Input tokens | `%,.0f` |
-| Cache read tokens | `%,.0f` |
-| Cache write tokens | `%,.0f` |
-| Output tokens | `%,.0f` |
-| Input rate (cr/M tok) | `%.2f` |
-| Output rate (cr/M tok) | `%.2f` |
-
-### 10.6 Detail Tab
-
-Raw row-level data table:
-
-| Column | Source | Format |
-|---|---|---|
-| Date | `usage_date` | default |
-| Source | `source` | default |
-| User | `user_name` | default |
-| Credits | `token_credits` | `%.6f` |
-| Cost | computed (`Credits * price_per_credit`) | `$%.4f` |
-| Tokens | `tokens` | `%d` |
-| Tokens/Credit | computed | `%,.0f` |
-| Request ID | `request_id` | default |
-
-Sorted by Date descending. Table height: 500px.
-
-### 10.7 Pricing Reference Tab
-
-**Section 1: Published pricing table**
-- Header: "Snowflake AI Features Credit Table"
-- Caption: "Table 6(g): Cortex Code — Credits per 1M tokens by model and token type"
-- Data source: `st.session_state.get("refreshed_pricing", CORTEX_CODE_PRICING)`
-- Columns: Model, Input (`%.2f`), Cache Read (`%.2f`), Cache Write (`%.2f`), Output (`%.2f`)
-- Each number column has a help tooltip explaining it.
-
-**Section 2: Disclaimer**
-`st.warning` noting pricing is subject to change, with link to the official PDF.
-
-**Section 3: Refresh instructions**
-`st.markdown` block explaining three update methods:
-1. Manual download + stage upload (with SQL `PUT` example and Snowsight UI instructions).
-2. External Access Integration.
-3. Edit the built-in `CORTEX_CODE_PRICING` dict.
-
-**Section 4: Refresh buttons** (3-column layout)
-- **"Refresh from PDF"** (local only, hidden in SIS): Downloads PDF from `CONSUMPTION_TABLE_URL`, uploads to `PRICING_STAGE`, parses with `AI_PARSE_DOCUMENT`.
-- **"Refresh from Stage"** (both environments): Parses the already-staged PDF with `AI_PARSE_DOCUMENT`.
-- **Info column**: Shows whether pricing was refreshed or is using defaults.
-
-**Section 5: Observed vs. Published rates**
-If `granular_filtered` (the post-filter granular data) is non-empty, show a comparison table iterating over `model_summary` (from the Models tab). For each model and each token type, show both the observed rate (derived from actual usage: `credits / tokens * 1M`) and the published rate (from the active pricing dict). Format: `%.2f`. If `granular_filtered` is empty (either no granular data at all or all filtered away), show `st.info` instead.
+Published Table 6(g) pricing table (from `st.session_state["refreshed_pricing"]` or `CORTEX_CODE_PRICING`), a "subject to change" disclaimer, refresh instructions, **Refresh from PDF** (local only) / **Refresh from Stage** buttons using `AI_PARSE_DOCUMENT`, and an observed-vs-published rate comparison driven by `model_summary`.
 
 ---
 
-## 11. Pricing Refresh Logic
+## 10. Pricing Refresh Logic
 
-### 11.1 PDF Parsing (`refresh_pricing_from_pdf` and `refresh_pricing_from_stage`)
-
-Both functions share the same parsing logic after obtaining the raw JSON:
-
-1. Call `AI_PARSE_DOCUMENT(TO_FILE('@{PRICING_STAGE}', 'CreditConsumptionTable.pdf'), {'mode': 'LAYOUT', 'page_split': true})::VARCHAR`.
-2. Parse the JSON result.
-3. Iterate over `pages`. Find the page containing both `"6(g)"` and `"cortex code"` (case-insensitive).
-4. Parse pipe-delimited table rows:
-   - Skip blank lines, `---` separators, lines starting with "Model" or "Snowflake".
-   - Require at least 5 pipe-separated parts.
-   - Model name must start with a lowercase letter (`^[a-z]`).
-   - Extract: `parts[0]` = model, `parts[1]` = input, `parts[2]` = output, `parts[3]` = cache_write (or 0 if `"-"`), `parts[4]` = cache_read.
-5. Store in session state as `refreshed_pricing`.
-6. Break after first matching page.
-
-### 11.2 `refresh_pricing_from_pdf` (Local Only)
-
-Before parsing:
-1. Raise `RuntimeError` if `IS_SIS` is True.
-2. Download the PDF from `CONSUMPTION_TABLE_URL` to a temp directory. Use a custom `User-Agent` header to avoid being blocked:
-   ```python
-   req = urllib.request.Request(url, headers={
-       "User-Agent": "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36"
-   })
-   ```
-3. Create the database, schema, and stage if they don't exist.
-4. `PUT` the file to the stage.
-
-### 11.3 `refresh_pricing_from_stage` (Both Environments)
-
-Directly calls `AI_PARSE_DOCUMENT` on the staged file (assumes it already exists).
+`refresh_pricing_from_pdf` (local only) downloads the Consumption Table PDF with a browser `User-Agent`, creates DB/schema/stage (`SNOWFLAKE_SSE` encryption), `PUT`s the file, then parses. `refresh_pricing_from_stage` parses the already-staged file. Both call `AI_PARSE_DOCUMENT(TO_FILE('@{PRICING_STAGE}', 'CreditConsumptionTable.pdf'), {'mode': 'LAYOUT', 'page_split': true})`, locate the page containing `6(g)` + `cortex code`, parse pipe-delimited rows (model must start lowercase; columns: model, input, output, cache_write|"-", cache_read), and store results in `st.session_state["refreshed_pricing"]`.
 
 ---
 
-## 12. Footer Captions
+## 11. Footer
 
-Two `st.caption` lines at the bottom of the page (outside all tabs):
-
-1. Pricing note about the April 1, 2026 credit price change ($2.00 global / $2.20 in-region).
-2. Data source note showing which `ACCOUNT_USAGE` views are available and the current price per credit.
+A single `st.caption` noting the `ACCOUNT_USAGE` source, the available Cortex Code sources, the active AI/customer credit prices, the billing model, and the full list of covered products.
 
 ---
 
-## 13. Deployment
+## 12. Deployment
 
-### 13.1 `snowflake.yml`
+### 12.1 `snowflake.yml`
 
 ```yaml
 definition_version: 2
@@ -442,7 +209,7 @@ entities:
       name: CORTEX_CODE_CONSUMPTION_DASHBOARD
       database: CORTEX_CODE_DASHBOARD
       schema: PUBLIC
-    query_warehouse: COMPUTE_G2_M
+    query_warehouse: COMPUTE_G2_S
     runtime_name: SYSTEM$ST_CONTAINER_RUNTIME_PY3_11
     compute_pool: STREAMLIT_COMPUTE_POOL
     external_access_integrations:
@@ -453,39 +220,41 @@ entities:
       - pyproject.toml
 ```
 
-### 13.2 Deploy Command
+### 12.2 Deploy
 
 ```bash
 snow streamlit deploy --replace
 ```
 
-### 13.3 Prerequisites
+### 12.3 Prerequisites
 
-- A Snowflake account with Cortex Code usage data.
-- ACCOUNTADMIN or a role with access to `SNOWFLAKE.ACCOUNT_USAGE` views.
-- A warehouse (e.g., `COMPUTE_G2_M`) and a compute pool (e.g., `STREAMLIT_COMPUTE_POOL`).
-- External access integration `PYPI_ACCESS_INTEGRATION` for installing Python packages from PyPI in SIS.
-- For pricing refresh: the stage `CORTEX_CODE_DASHBOARD.PUBLIC.PRICING_DOCS` with encryption type `SNOWFLAKE_SSE`, and access to the `AI_PARSE_DOCUMENT` Cortex function.
+- ACCOUNTADMIN, or a role with `IMPORTED PRIVILEGES` on the `SNOWFLAKE` database, to read `ACCOUNT_USAGE`.
+- A query warehouse and a compute pool for SiS.
+- `PYPI_ACCESS_INTEGRATION` for PyPI installs in SiS.
+- For pricing refresh: the `PRICING_STAGE` with `SNOWFLAKE_SSE` encryption and access to `AI_PARSE_DOCUMENT`.
 
 ---
 
-## 14. File Structure
+## 13. File Structure
 
 ```
 project-root/
 ├── streamlit_app.py   # The entire application (single file)
 ├── pyproject.toml     # Python dependencies
 ├── snowflake.yml      # Snow CLI deployment config
+├── README.md
 └── SPEC.md            # This file
 ```
 
 ---
 
-## 15. Key Behaviors & Edge Cases
+## 14. Key Behaviors & Edge Cases
 
-- If neither ACCOUNT_USAGE view returns data, show an error and stop.
-- If granular data is unavailable (LATERAL FLATTEN fails or returns nothing), the Models tab shows an info message and the pricing comparison section is skipped. This is non-fatal.
-- Silently skip individual source queries that fail (e.g., if the Snowsight view doesn't exist yet).
-- Empty multi-select filters are treated as "select all" (no filter applied).
-- Caching TTL is 600 seconds (10 minutes) for both data loaders. The Reset button clears all caches and session state.
-- All column names are lowercased after query execution for consistency between SIS and local runtimes.
+- `ACCOUNT_USAGE` has up to 45-minute latency; loaders cache for 600 seconds.
+- If no Cortex Code data is returned from any source, show an error and `st.stop()`.
+- Every other loader fails silently (empty DataFrame) so a missing/unavailable view simply hides that product's tab content.
+- Cortex Code views expose `USER_NAME` directly — no `USERS` join.
+- REST API has no credits column → token volume only.
+- AISQL is excluded from the Overview grand total to avoid double-counting with AI Functions.
+- Empty multiselect filters are treated as "select all".
+- All column names are lowercased after query execution for SiS/local consistency.
